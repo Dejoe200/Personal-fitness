@@ -1,0 +1,467 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Steady — Sync your fitness</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<!-- Supabase SDK -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
+  body { font-family: 'Inter', system-ui, sans-serif; background:#1C1E22; }
+  .heading-font { font-family: 'Space Grotesk', sans-serif; }
+  .card { background: #25282E; border-radius: 24px; }
+  .streak-number { font-size: 40px; line-height: 1; font-weight: 700; }
+  .fade-in { animation: fadeIn 0.35s ease; }
+  .dark-date { color-scheme: dark; } /* Ensures the date picker icon is visible on dark mode */
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px);} to { opacity:1; transform: translateY(0);} }
+</style>
+</head>
+<body class="min-h-screen">
+
+<div id="app" class="max-w-md mx-auto min-h-screen flex flex-col"></div>
+
+<!-- Toast -->
+<div id="toast" class="hidden fixed bottom-8 left-1/2 -translate-x-1/2 bg-zinc-800 text-white text-sm px-6 py-3 rounded-3xl shadow-2xl flex items-center gap-3 z-50 transition-transform duration-300">
+  <i class="fa-solid fa-check text-emerald-400"></i>
+  <span id="toast-text">Saved</span>
+</div>
+
+<script>
+/* ---------- Supabase Configuration ---------- */
+const SUPABASE_URL = 'https://kqfnrggvprrqrzaqllcb.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_glWFOI6tySme3Ik6...'; // Replace with your FULL actual publishable key
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+/* ---------- State Management ---------- */
+let currentUser = null;
+let logs = [];  // Array of 'YYYY-MM-DD' strings
+let goals = []; // Array of goal objects
+let isLoading = true;
+
+// Listen to Auth State Changes
+supabaseClient.auth.onAuthStateChange((event, session) => {
+  if (session) {
+    currentUser = session.user;
+    fetchData();
+  } else {
+    currentUser = null;
+    logs = [];
+    goals = [];
+    isLoading = false;
+    render();
+  }
+});
+
+/* ---------- Data Layer (Backend API Calls) ---------- */
+
+async function fetchData() {
+  isLoading = true;
+  render();
+
+  try {
+    const [logsRes, goalsRes] = await Promise.all([
+      supabaseClient.from('logs').select('logged_date').eq('user_id', currentUser.id),
+      supabaseClient.from('goals').select('*').eq('user_id', currentUser.id).order('created_at', { ascending: true })
+    ]);
+
+    if (logsRes.data) logs = logsRes.data.map(l => l.logged_date);
+    if (goalsRes.data) goals = goalsRes.data;
+  } catch (err) {
+    showToast('Failed to load data', false);
+  }
+
+  isLoading = false;
+  render();
+}
+
+async function handleAuth(action) {
+  const email = document.getElementById('email-input').value.trim();
+  const password = document.getElementById('password-input').value;
+
+  if (!email || !password) {
+    showToast('Email and password required', false);
+    return;
+  }
+
+  isLoading = true;
+  render();
+
+  let res;
+  if (action === 'login') {
+    res = await supabaseClient.auth.signInWithPassword({ email, password });
+  } else {
+    res = await supabaseClient.auth.signUp({ email, password });
+  }
+
+  if (res.error) {
+    showToast(res.error.message, false);
+    isLoading = false;
+    render();
+  } else {
+    showToast(action === 'login' ? 'Welcome back!' : 'Sign up successful!');
+  }
+}
+
+async function handleLogout() {
+  await supabaseClient.auth.signOut();
+}
+
+async function toggleToday() {
+  const t = todayStr();
+  const isLogged = isLoggedOn(t);
+
+  // Optimistic UI update
+  if (isLogged) {
+    logs = logs.filter(d => d !== t);
+  } else {
+    logs.push(t);
+  }
+  render();
+
+  // API sync
+  let error;
+  if (isLogged) {
+    const res = await supabaseClient.from('logs').delete().match({ user_id: currentUser.id, logged_date: t });
+    error = res.error;
+  } else {
+    const res = await supabaseClient.from('logs').insert([{ user_id: currentUser.id, logged_date: t }]);
+    error = res.error;
+  }
+
+  if (error) {
+    // Revert optimistic update on failure
+    if (isLogged) logs.push(t);
+    else logs = logs.filter(d => d !== t);
+    render();
+    showToast('Failed to save to cloud', false);
+  } else {
+    showToast(isLogged ? 'Unmarked for today' : 'Workout logged for today');
+  }
+}
+
+async function addGoal() {
+  const textInput = document.getElementById('new-goal-text');
+  const dateInput = document.getElementById('new-goal-date');
+  const text = textInput.value.trim();
+  const target = dateInput.value;
+
+  if (!text) return;
+
+  const newGoal = {
+    user_id: currentUser.id,
+    goal_text: text,
+    target_date: target || null,
+    is_completed: false
+  };
+
+  const { data, error } = await supabaseClient.from('goals').insert([newGoal]).select();
+
+  if (error) {
+    showToast('Failed to add goal', false);
+  } else if (data) {
+    goals.push(data[0]);
+    showToast('Goal added');
+    render();
+  }
+}
+
+async function toggleGoal(id, currentStatus) {
+  const newStatus = !currentStatus;
+  
+  // Optimistic UI update
+  const g = goals.find(g => g.id === id);
+  if (g) g.is_completed = newStatus;
+  render();
+
+  const { error } = await supabaseClient.from('goals').update({ is_completed: newStatus }).eq('id', id);
+  
+  if (error) {
+    if (g) g.is_completed = currentStatus; // Revert on failure
+    render();
+    showToast('Failed to update goal', false);
+  }
+}
+
+async function deleteGoal(id) {
+  const { error } = await supabaseClient.from('goals').delete().eq('id', id);
+  if (!error) {
+    goals = goals.filter(g => g.id !== id);
+    showToast('Goal deleted');
+    render();
+  } else {
+    showToast('Failed to delete goal', false);
+  }
+}
+
+/* ---------- Utility Functions ---------- */
+
+function todayStr(offsetDays = 0) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toISOString().slice(0,10);
+}
+
+function isLoggedOn(dateStr) { return logs.includes(dateStr); }
+
+function computeStreak() {
+  const logSet = new Set(logs);
+  let streak = 0;
+  let cursor = logSet.has(todayStr()) ? 0 : -1; 
+  if (cursor === -1 && !logSet.has(todayStr(-1))) return 0; 
+  let offset = logSet.has(todayStr()) ? 0 : -1;
+  while (logSet.has(todayStr(offset))) {
+    streak++;
+    offset--;
+  }
+  return streak;
+}
+
+function totalSessions() { return logs.length; }
+
+function weekDays() {
+  const days = [];
+  for (let i = -6; i <= 0; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    days.push({
+      label: d.toLocaleDateString('en-US', { weekday: 'narrow' }),
+      dateStr: d.toISOString().slice(0,10),
+      isToday: i === 0
+    });
+  }
+  return days;
+}
+
+function showToast(msg, positive = true) {
+  const toast = document.getElementById('toast');
+  const text = document.getElementById('toast-text');
+  text.textContent = msg;
+  toast.querySelector('i').className = positive ? 'fa-solid fa-check text-emerald-400' : 'fa-solid fa-xmark text-zinc-400';
+  toast.classList.remove('hidden');
+  toast.style.transform = 'translate(-50%, 0)';
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => {
+    toast.style.transform = 'translate(-50%, 100px)';
+    setTimeout(() => toast.classList.add('hidden'), 500);
+  }, 2200);
+}
+
+function escapeHTML(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+/* ---------- Views ---------- */
+
+function renderLoading() {
+  return `
+    <div class="flex-1 flex items-center justify-center fade-in">
+      <i class="fa-solid fa-circle-notch fa-spin text-amber-500 text-3xl"></i>
+    </div>
+  `;
+}
+
+function renderAuth() {
+  return `
+  <div class="flex-1 flex flex-col justify-center px-8 py-16 fade-in">
+    <div class="flex items-center gap-2 mb-10">
+      <div class="w-8 h-8 bg-amber-500 rounded-2xl flex items-center justify-center">
+        <i class="fa-solid fa-anchor text-white text-sm"></i>
+      </div>
+      <span class="heading-font text-2xl tracking-tighter text-white font-semibold">steady</span>
+    </div>
+
+    <h1 class="heading-font text-4xl text-white leading-tight mb-4">
+      Sync your fitness journey.
+    </h1>
+    <p class="text-zinc-400 text-base leading-relaxed mb-8">
+      Log your workouts, set target goals, and securely sync your stats across all your devices using Supabase cloud infrastructure.
+    </p>
+
+    <label class="text-xs uppercase tracking-widest text-zinc-500 mb-2">Account Details</label>
+    <input id="email-input" type="email" placeholder="Email address"
+      class="bg-[#25282E] text-white placeholder-zinc-500 rounded-2xl px-5 py-4 mb-3 outline-none border border-white/5 focus:border-amber-400 transition-colors" />
+    <input id="password-input" type="password" placeholder="Password"
+      class="bg-[#25282E] text-white placeholder-zinc-500 rounded-2xl px-5 py-4 mb-6 outline-none border border-white/5 focus:border-amber-400 transition-colors" />
+
+    <div class="flex flex-col gap-3">
+      <button onclick="handleAuth('login')"
+        class="w-full bg-[#F2A65A] hover:bg-amber-400 active:scale-[0.98] transition-all text-[#1C1E22] font-semibold text-lg py-4 rounded-3xl">
+        Log In
+      </button>
+      <button onclick="handleAuth('signup')"
+        class="w-full bg-transparent border border-white/10 hover:border-amber-400 hover:text-amber-400 active:scale-[0.98] transition-all text-white font-semibold text-lg py-4 rounded-3xl">
+        Sign Up
+      </button>
+    </div>
+  </div>`;
+}
+
+function renderDashboard() {
+  // Parse user's display name from email (e.g. athlete@example.com -> athlete)
+  const displayName = currentUser?.email?.split('@')[0] || 'Athlete';
+  const name = displayName.charAt(0).toUpperCase() + displayName.slice(1);
+  
+  const loggedToday = isLoggedOn(todayStr());
+  const streak = computeStreak();
+  const sessions = totalSessions();
+  const days = weekDays();
+
+  const weekHTML = days.map(d => `
+    <div class="flex flex-col items-center gap-2">
+      <span class="text-[10px] text-zinc-500">${d.label}</span>
+      <div class="w-7 h-7 rounded-full flex items-center justify-center text-[11px] transition-colors
+        ${isLoggedOn(d.dateStr) ? 'bg-amber-400 text-[#1C1E22]' : d.isToday ? 'border-2 border-dashed border-amber-400 text-transparent' : 'bg-zinc-700 text-transparent'}">
+        ${isLoggedOn(d.dateStr) ? '✓' : ''}
+      </div>
+    </div>
+  `).join('');
+
+  return `
+  <div class="fade-in flex-1 flex flex-col">
+    <!-- Header -->
+    <div class="flex items-center justify-between px-6 pt-8 pb-4">
+      <div class="flex items-center gap-2">
+        <div class="w-7 h-7 bg-amber-500 rounded-2xl flex items-center justify-center">
+          <i class="fa-solid fa-anchor text-white text-xs"></i>
+        </div>
+        <span class="heading-font text-2xl tracking-tighter text-white font-semibold">steady</span>
+      </div>
+      <button onclick="handleLogout()" class="text-zinc-500 hover:text-red-400 text-sm flex items-center gap-2 transition-colors">
+        <span class="text-[10px] font-bold uppercase tracking-widest hidden sm:block">Log Out</span>
+        <i class="fa-solid fa-arrow-right-from-bracket"></i>
+      </button>
+    </div>
+
+    <!-- Greeting -->
+    <div class="px-6 pb-6">
+      <div class="text-[#F5F3EF] text-3xl heading-font tracking-tighter leading-tight">
+        Good to see you,<br>${escapeHTML(name)}
+      </div>
+      <div class="text-zinc-400 mt-2 text-sm">${new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' })}</div>
+    </div>
+
+    <!-- Today Card -->
+    <div class="px-6 pb-6">
+      <div class="card p-8 border border-white/5">
+        <div class="flex justify-between items-start">
+          <div>
+            <div class="uppercase tracking-[1px] text-xs text-amber-400 font-medium">Today</div>
+            <div class="text-5xl heading-font mt-3 leading-none ${loggedToday ? 'text-emerald-400' : 'text-white'}">
+              ${loggedToday ? 'Logged' : 'Not yet'}
+            </div>
+            <div class="text-zinc-400 mt-1">${loggedToday ? 'Nice work today' : 'No workout logged'}</div>
+          </div>
+          <div class="w-14 h-14 bg-[#1C1E22] rounded-3xl flex items-center justify-center text-2xl ${loggedToday ? 'text-emerald-400' : 'text-zinc-500'}">
+            <i class="fa-solid ${loggedToday ? 'fa-check' : 'fa-circle-notch'}"></i>
+          </div>
+        </div>
+        <button onclick="toggleToday()"
+          class="mt-8 w-full py-4 rounded-3xl text-sm font-semibold tracking-widest border border-dashed transition-colors
+          ${loggedToday ? 'border-emerald-400 text-emerald-400' : 'border-zinc-500 text-zinc-400 hover:border-amber-400 hover:text-amber-400'}">
+          ${loggedToday ? 'MARK AS UNDONE' : 'MARK AS LOGGED'}
+        </button>
+      </div>
+    </div>
+
+    <!-- Stats Card -->
+    <div class="px-6 pb-6">
+      <div class="card p-6 flex items-center justify-between">
+        <div>
+          <div class="text-xs uppercase tracking-widest text-zinc-400">Current streak</div>
+          <div class="streak-number text-white">${streak}</div>
+          <div class="text-sm text-zinc-400 -mt-1">day${streak === 1 ? '' : 's'}</div>
+        </div>
+        <div class="text-right">
+          <div class="text-xs uppercase tracking-widest text-zinc-400">Total sessions</div>
+          <div class="streak-number text-white">${sessions}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Week Card -->
+    <div class="px-6 pb-6">
+      <div class="card p-6 border border-white/5">
+        <div class="text-xs uppercase tracking-widest text-zinc-400 mb-4">This week</div>
+        <div class="flex justify-between">${weekHTML}</div>
+      </div>
+    </div>
+
+    <!-- Goals Card -->
+    <div class="px-6 pb-6">
+      <div class="card p-6 border border-white/5">
+        <div class="text-xs uppercase tracking-widest text-zinc-400 mb-4">Fitness Goals</div>
+        
+        <div class="space-y-3 mb-5">
+          ${goals.length === 0 ? '<p class="text-sm text-zinc-500 italic pb-2">No goals set yet.</p>' : goals.map(g => `
+            <div class="flex items-center justify-between bg-[#1C1E22] p-3 rounded-2xl border border-white/5">
+              <div class="flex items-center gap-3 overflow-hidden">
+                 <button onclick="toggleGoal('${g.id}', ${g.is_completed})" class="w-6 h-6 shrink-0 rounded-full border-2 ${g.is_completed ? 'bg-emerald-400 border-emerald-400' : 'border-zinc-500'} flex items-center justify-center transition-colors">
+                    <i class="fa-solid fa-check text-[#1C1E22] text-[10px] ${g.is_completed ? '' : 'hidden'}"></i>
+                 </button>
+                 <div class="${g.is_completed ? 'text-zinc-500 line-through' : 'text-white'} text-sm flex flex-col truncate">
+                   <span class="truncate">${escapeHTML(g.goal_text)}</span>
+                   ${g.target_date ? `<span class="text-[10px] ${g.is_completed ? 'text-zinc-600' : 'text-amber-400/70'}">Target: ${g.target_date}</span>` : ''}
+                 </div>
+              </div>
+              <button onclick="deleteGoal('${g.id}')" class="text-zinc-600 hover:text-red-400 p-2 shrink-0 transition-colors">
+                <i class="fa-solid fa-trash text-xs"></i>
+              </button>
+            </div>
+          `).join('')}
+        </div>
+
+        <div class="flex flex-col gap-2 bg-[#1C1E22] p-2 rounded-2xl border border-white/5">
+          <input id="new-goal-text" type="text" placeholder="Add a new goal..." class="w-full bg-transparent text-white px-3 py-2 rounded-xl text-sm outline-none focus:border-amber-400/50">
+          <div class="flex gap-2">
+            <input id="new-goal-date" type="date" title="Target Date" class="flex-1 bg-[#25282E] text-zinc-400 px-3 py-2 rounded-xl text-sm border border-white/5 outline-none focus:border-amber-400/50 dark-date">
+            <button onclick="addGoal()" class="bg-amber-500 hover:bg-amber-400 active:scale-[0.97] transition-all text-[#1C1E22] px-4 py-2 rounded-xl font-bold">
+              <i class="fa-solid fa-plus"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex-1"></div>
+
+    <!-- Main CTA -->
+    <div class="px-6 pb-6">
+      <button onclick="toggleToday()"
+        class="w-full bg-[#F2A65A] hover:bg-amber-400 active:scale-[0.98] transition-all text-[#1C1E22] font-semibold text-lg py-5 rounded-3xl shadow-xl shadow-amber-500/20 flex items-center justify-center gap-3">
+        <i class="fa-solid fa-plus"></i>
+        <span>${loggedToday ? "TODAY'S ALREADY LOGGED" : "LOG TODAY'S WORKOUT"}</span>
+      </button>
+    </div>
+
+    <!-- Footer -->
+    <div class="px-6 pb-10 flex flex-col items-center gap-2">
+      <div class="flex items-center gap-2 text-[10px] text-zinc-500 tracking-wider">
+        <i class="fa-solid fa-cloud"></i>
+        <span>SECURELY SYNCED TO SUPABASE CLOUD</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function render() {
+  const app = document.getElementById('app');
+  if (isLoading) {
+    app.innerHTML = renderLoading();
+  } else if (currentUser) {
+    app.innerHTML = renderDashboard();
+  } else {
+    app.innerHTML = renderAuth();
+  }
+}
+
+// Initial Call
+render();
+</script>
+</body>
+</html>
